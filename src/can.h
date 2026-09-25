@@ -1,5 +1,8 @@
+#pragma once
+
 #include <ACAN2517FD.h>
 #include <SPI.h>
+#include <driver/gpio.h>
 
 namespace Can
 {
@@ -11,8 +14,19 @@ static const unsigned long max_heating_time = 3 * 60 * 60 * 1000;
 static const byte MCP2517_INT = 3; // INT output of MCP2517FD
 ACAN2517FD can(SS, SPI, MCP2517_INT);
 
+// MCP2517FD/MCP2518FD registers (DS20005688B) used for sleep handling, not exposed by ACAN2517FD.
+// Bit positions match the Linux mcp251xfd driver (drivers/net/can/spi/mcp251xfd/mcp251xfd.h).
+static const uint16_t REG_CON = 0x000;
+static const uint16_t REG_INT = 0x01C;
+static const uint16_t REG_OSC = 0xE00;
+static const uint16_t REG_IOCON = 0xE04;
+static const uint8_t MODE_SLEEP = 0x01;
+static const uint8_t MODE_CONFIGURATION = 0x04;
+static const SPISettings rawSpiSettings(800UL * 1000, MSBFIRST, SPI_MODE0);
+
 // State
 unsigned long latest_loop_run = 0;
+unsigned long last_activity = 0; // millis() of the last received CAN frame
 bool do_send = false;
 unsigned long do_send_updated_at = 0;
 bool first = true;
@@ -147,9 +161,107 @@ void setHeatingRequestStateCallback(void (*func)(bool))
     heatingRequestStateCallback = func;
 }
 
+void rawWriteRegister8(uint16_t address, uint8_t value)
+{
+    SPI.beginTransaction(rawSpiSettings);
+    digitalWrite(SS, LOW);
+    SPI.transfer16(0x2000 | (address & 0x0FFF)); // Write instruction
+    SPI.transfer(value);
+    digitalWrite(SS, HIGH);
+    SPI.endTransaction();
+}
+
+uint8_t rawReadRegister8(uint16_t address)
+{
+    SPI.beginTransaction(rawSpiSettings);
+    digitalWrite(SS, LOW);
+    SPI.transfer16(0x3000 | (address & 0x0FFF)); // Read instruction
+    uint8_t value = SPI.transfer(0x00);
+    digitalWrite(SS, HIGH);
+    SPI.endTransaction();
+    return value;
+}
+
+uint8_t currentMode()
+{
+    return (rawReadRegister8(REG_CON + 2) >> 5) & 0x07; // CiCON.OPMOD
+}
+
+bool waitForMode(uint8_t mode, unsigned long timeout_ms)
+{
+    unsigned long start = millis();
+    while (currentMode() != mode)
+    {
+        if (millis() - start > timeout_ms)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Bring the MCP2517FD out of Sleep mode (if it is there) so that begin() can reset it
+void wakeController()
+{
+    uint8_t osc = rawReadRegister8(REG_OSC);
+    if ((osc & (1 << 2)) == 0) // OSC.OSCDIS
+    {
+        return;
+    }
+    rawWriteRegister8(REG_OSC, osc & ~(1 << 2));
+    unsigned long start = millis();
+    while ((rawReadRegister8(REG_OSC + 1) & (1 << 2)) == 0) // OSC.OSCRDY
+    {
+        if (millis() - start > 10)
+        {
+            printf("MCP2517FD oscillator not ready after wake\n");
+            return;
+        }
+    }
+    printf("MCP2517FD woken from sleep\n");
+}
+
+// Put the MCP2517FD into Sleep mode with only the bus wake-up interrupt enabled, so that
+// its INT pin is pulled low on the next CAN bus activity. Holds CS high while the ESP32 sleeps.
+bool sleep()
+{
+    detachInterrupt(digitalPinToInterrupt(MCP2517_INT));
+
+    rawWriteRegister8(REG_CON + 3, MODE_CONFIGURATION | (1 << 3)); // Request configuration mode, abort transmissions
+    if (!waitForMode(MODE_CONFIGURATION, 10))
+    {
+        printf("MCP2517FD did not enter configuration mode\n");
+        return false;
+    }
+
+    rawWriteRegister8(REG_INT + 2, 0x00);     // Disable RX/TX/TEF/MOD/TBC interrupts
+    rawWriteRegister8(REG_INT + 3, (1 << 6)); // WAKIE only
+    rawWriteRegister8(REG_INT + 1, 0x00);     // Clear pending flags (incl. WAKIF)
+    rawWriteRegister8(REG_INT, 0x00);
+
+    rawWriteRegister8(REG_CON + 3, MODE_SLEEP);
+    unsigned long start = millis();
+    // OSC.OSCDIS is set while in Sleep mode (LPMEN is left cleared, so SPI reads don't wake it)
+    while ((rawReadRegister8(REG_OSC) & (1 << 2)) == 0 && currentMode() != MODE_SLEEP)
+    {
+        if (millis() - start > 10)
+        {
+            printf("MCP2517FD did not enter sleep mode\n");
+            return false;
+        }
+    }
+
+    gpio_hold_en((gpio_num_t)SS);
+    return true;
+}
+
 void setup()
 {
+    gpio_hold_dis((gpio_num_t)SS); // Released from sleep hold, see sleep()
+    pinMode(SS, OUTPUT);
+    digitalWrite(SS, HIGH);
     SPI.begin(SCK, MISO, MOSI);
+    wakeController();
     // ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_20MHz, 500 * 1000, DataBitRateFactor::x4);
     // ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_4MHz10xPLL, 500 * 1000, DataBitRateFactor::x4);
     ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_40MHz, 500 * 1000, DataBitRateFactor::x4);
@@ -197,6 +309,14 @@ void setup()
                                          { can.isr(); }, filters);
     if (errorCode == 0)
     {
+#ifdef CAN_XSTBY
+        // Let nINT0/GPIO0/XSTBY drive the transceiver STBY pin: low while the controller runs,
+        // high (transceiver standby) while it is in Sleep mode. Requires STBY wired to GPIO0.
+        uint8_t iocon0 = rawReadRegister8(REG_IOCON);
+        rawWriteRegister8(REG_IOCON, (iocon0 & ~(1 << 0)) | (1 << 6)); // TRIS0 = 0 (output), XSTBYEN = 1
+        uint8_t iocon1 = rawReadRegister8(REG_IOCON + 1);
+        rawWriteRegister8(REG_IOCON + 1, iocon1 & ~(1 << 0)); // LAT0 = 0 (transceiver active outside Sleep)
+#endif
         printf("Arbitration : %d / %d / %d (%d bits/s, SP %d%%)\n", settings.mArbitrationPhaseSegment1, settings.mArbitrationPhaseSegment2, settings.mArbitrationSJW, settings.actualArbitrationBitRate(), settings.arbitrationSamplePointFromBitStart());
         printf("Data phase  : %d / %d / %d (%d bits/s, SP %d%%)\n", settings.mDataPhaseSegment1, settings.mDataPhaseSegment2, settings.mDataSJW, settings.actualDataBitRate(), settings.dataSamplePointFromBitStart());
     }
@@ -289,7 +409,10 @@ void loop()
         }
         updateData();
     }
-    can.dispatchReceivedMessage();
+    if (can.dispatchReceivedMessage())
+    {
+        last_activity = millis();
+    }
 }
 
 }

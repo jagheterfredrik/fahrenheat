@@ -1,3 +1,5 @@
+#pragma once
+
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEOta.h>
@@ -199,10 +201,6 @@ namespace Ble
         pAdvertising->start();
     }
 
-    bool sleep = false;
-    unsigned long last_sleep_wake = 0;
-    unsigned long last_wake = 0;
-
     void loop()
     {
         NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
@@ -269,23 +267,5 @@ namespace Ble
             pAdvertising->start();
         }
 
-
-        // if ((millis() - last_sleep_wake) > 500) {
-        //     printf("Going to sleep %d\n", millis());
-        //     pAdvertising->stop();
-        //     if (NimBLEDevice::getServer()->getConnectedCount() == 0) {
-        //         printf("Sleeping for real\n");
-        //         esp_sleep_enable_timer_wakeup(5000000);
-        //         esp_light_sleep_start();
-        //     }
-        //     // sleep = !sleep;
-        //     last_sleep_wake = millis();
-        // }
-        //  else if (!sleep && (millis() - last_sleep_wake) > 4500) {
-        //     printf("Woke %d\n", millis());
-        //     pAdvertising->start();
-        //     sleep = !sleep;
-        //     last_sleep_wake= millis();
-        // }
     }
 }

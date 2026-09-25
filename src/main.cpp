@@ -6,7 +6,7 @@
 #include "can.h"
 #include "pwm.h"
 #include "ble.h"
-// #include "sleep.h"
+#include "sleep.h"
 #include <Preferences.h>
 
 Preferences prefs;
@@ -26,10 +26,11 @@ void setup()
   Ble::setRequestHeatingCallback(Can::setSending);
   Can::setUpdateDataCallback(Ble::updateData);
   Can::setHeatingRequestStateCallback(Ble::updateHeatingState);
+  Sleep::setup();
 }
 
 void loop() {
   Can::loop();
   Ble::loop();
-  // Sleep::loop();
+  Sleep::loop();
 }
