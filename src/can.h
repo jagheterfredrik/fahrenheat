@@ -14,10 +14,12 @@ static const unsigned long max_heating_time = 3 * 60 * 60 * 1000;
 static const byte MCP2517_INT = 3; // INT output of MCP2517FD
 ACAN2517FD can(SS, SPI, MCP2517_INT);
 
-// MCP2517FD registers (DS20005688B) used for sleep handling, not exposed by ACAN2517FD
+// MCP2517FD/MCP2518FD registers (DS20005688B) used for sleep handling, not exposed by ACAN2517FD.
+// Bit positions match the Linux mcp251xfd driver (drivers/net/can/spi/mcp251xfd/mcp251xfd.h).
 static const uint16_t REG_CON = 0x000;
 static const uint16_t REG_INT = 0x01C;
 static const uint16_t REG_OSC = 0xE00;
+static const uint16_t REG_IOCON = 0xE04;
 static const uint8_t MODE_SLEEP = 0x01;
 static const uint8_t MODE_CONFIGURATION = 0x04;
 static const SPISettings rawSpiSettings(800UL * 1000, MSBFIRST, SPI_MODE0);
@@ -238,10 +240,15 @@ bool sleep()
     rawWriteRegister8(REG_INT, 0x00);
 
     rawWriteRegister8(REG_CON + 3, MODE_SLEEP);
-    if (!waitForMode(MODE_SLEEP, 10))
+    unsigned long start = millis();
+    // OSC.OSCDIS is set while in Sleep mode (LPMEN is left cleared, so SPI reads don't wake it)
+    while ((rawReadRegister8(REG_OSC) & (1 << 2)) == 0 && currentMode() != MODE_SLEEP)
     {
-        printf("MCP2517FD did not enter sleep mode\n");
-        return false;
+        if (millis() - start > 10)
+        {
+            printf("MCP2517FD did not enter sleep mode\n");
+            return false;
+        }
     }
 
     gpio_hold_en((gpio_num_t)SS);
@@ -302,6 +309,14 @@ void setup()
                                          { can.isr(); }, filters);
     if (errorCode == 0)
     {
+#ifdef CAN_XSTBY
+        // Let nINT0/GPIO0/XSTBY drive the transceiver STBY pin: low while the controller runs,
+        // high (transceiver standby) while it is in Sleep mode. Requires STBY wired to GPIO0.
+        uint8_t iocon0 = rawReadRegister8(REG_IOCON);
+        rawWriteRegister8(REG_IOCON, (iocon0 & ~(1 << 0)) | (1 << 6)); // TRIS0 = 0 (output), XSTBYEN = 1
+        uint8_t iocon1 = rawReadRegister8(REG_IOCON + 1);
+        rawWriteRegister8(REG_IOCON + 1, iocon1 & ~(1 << 0)); // LAT0 = 0 (transceiver active outside Sleep)
+#endif
         printf("Arbitration : %d / %d / %d (%d bits/s, SP %d%%)\n", settings.mArbitrationPhaseSegment1, settings.mArbitrationPhaseSegment2, settings.mArbitrationSJW, settings.actualArbitrationBitRate(), settings.arbitrationSamplePointFromBitStart());
         printf("Data phase  : %d / %d / %d (%d bits/s, SP %d%%)\n", settings.mDataPhaseSegment1, settings.mDataPhaseSegment2, settings.mDataSJW, settings.actualDataBitRate(), settings.dataSamplePointFromBitStart());
     }
